@@ -77,9 +77,44 @@ function numeroNaEtiqueta(pagina) {
   return achado ? achado[1] : null;
 }
 
-function nomeDoDestinatario(pagina) {
-  const achado = pagina.textoBruto.match(/CNPJ\/CPF\/ID Estrangeiro:\s*[\d.\-/]+\s+(.+?)\s{2,}/);
-  return achado ? achado[1].trim() : null;
+function consumidorDaNota(pagina) {
+  const achado = pagina.textoBruto.match(/CNPJ\/CPF\/ID Estrangeiro:\s*[\d.\-/]+\s+(.+?)\s{2,}([^,]+),/);
+  if (!achado) return { nome: null, rua: null };
+  const nome = achado[1].replace(/^(?:IE:\s*\S+\s+)?(?:[\d./-]+\s+)*/, '').trim();
+  return { nome, rua: achado[2].trim() };
+}
+
+function letrasMinusculas(texto) {
+  return texto
+    .normalize('NFD')
+    .replace(/[̀-ͯ]/g, '')
+    .toLowerCase()
+    .replace(/[^a-z\s]/g, ' ');
+}
+
+function palavrasDe(texto) {
+  return letrasMinusculas(texto).split(/\s+/).filter((palavra) => palavra.length >= 3);
+}
+
+function proporcaoNoTexto(texto, textoEtiqueta) {
+  const palavras = palavrasDe(texto);
+  if (!palavras.length) return 0;
+  return palavras.filter((palavra) => textoEtiqueta.includes(` ${palavra} `)).length / palavras.length;
+}
+
+function conferirDestinatario(consumidor, etiqueta) {
+  const { nome, rua } = consumidor;
+  if (!nome && !rua) return null;
+  const textoEtiqueta = ` ${letrasMinusculas(etiqueta.texto).replace(/\s+/g, ' ')} `;
+  const textoColado = textoEtiqueta.replace(/\s/g, '');
+
+  const apelido = (nome || '').match(/\(([^)]+)\)/);
+  const apelidoLetras = apelido ? letrasMinusculas(apelido[1]).replace(/\s/g, '') : '';
+  const apelidoConfere = apelidoLetras.length >= 6 && textoColado.includes(apelidoLetras.slice(0, 8));
+
+  const nomeConfere = nome ? proporcaoNoTexto(nome.replace(/\(.*?\)/g, ''), textoEtiqueta) >= 0.6 : false;
+  const ruaConfere = rua ? proporcaoNoTexto(rua, textoEtiqueta) >= 0.6 : false;
+  return nomeConfere || apelidoConfere || ruaConfere ? 'confere' : 'diverge';
 }
 
 function rastreioDaEtiqueta(pagina) {
@@ -121,13 +156,15 @@ function parear(paginas) {
       metodo = 'ordem das páginas';
     }
     if (parceira >= 0) usadas.add(parceira);
+    const consumidor = consumidorDaNota(pagina);
     pares.push({
       modelo: 'nota',
       rotulo,
       principal: i,
       secundaria: parceira >= 0 ? parceira : null,
       metodo: parceira >= 0 ? metodo : null,
-      destinatario: nomeDoDestinatario(pagina),
+      destinatario: consumidor.nome,
+      conferencia: parceira >= 0 ? conferirDestinatario(consumidor, paginas[parceira]) : null,
     });
   });
 
@@ -309,6 +346,13 @@ function criarElemento(tag, atributos = {}, filhos = []) {
   return el;
 }
 
+function textoDoDestinatario(par) {
+  if (!par.destinatario) return '';
+  if (par.conferencia === 'confere') return `✓ ${par.destinatario}`;
+  if (par.conferencia === 'diverge') return `⚠ ${par.destinatario}`;
+  return par.destinatario;
+}
+
 function cartaoDeResultado(nome, resultado, porFolha) {
   const url = URL.createObjectURL(new Blob([resultado.bytes], { type: 'application/pdf' }));
   const nomeSaida = `A4-${porFolha}por-folha-${nome}`;
@@ -322,13 +366,17 @@ function cartaoDeResultado(nome, resultado, porFolha) {
       criarElemento('td', { texto: par.rotulo }),
       criarElemento('td', { texto: ROTULO_MODELO[par.modelo] }),
       criarElemento('td', { texto: par.metodo ? `por ${par.metodo}` : '—' }),
-      criarElemento('td', { texto: par.destinatario || '' }),
+      criarElemento('td', { texto: textoDoDestinatario(par) }),
     ])
   );
 
+  const divergentes = resultado.pares.filter((p) => p.conferencia === 'diverge');
   const avisos = [...resultado.avisos];
   if (semPar) avisos.push(`${semPar} peça(s) ficaram sem par e saíram sozinhas em uma folha.`);
-  if (porOrdem) avisos.push(`${porOrdem} par(es) foram juntados pela ordem das páginas. Confira o nome do destinatário.`);
+  if (porOrdem) avisos.push(`${porOrdem} ${plural(porOrdem, 'par foi juntado', 'pares foram juntados')} pela ordem das páginas (a etiqueta não traz a chave nem o número da nota). Confira o destinatário na tabela.`);
+  divergentes.forEach((par) =>
+    avisos.push(`${par.rotulo}: o destinatário da etiqueta não parece ser o mesmo do DANFE. Confira antes de imprimir.`)
+  );
 
   return criarElemento('section', { class: 'cartao' }, [
     criarElemento('h2', { texto: nome }),
