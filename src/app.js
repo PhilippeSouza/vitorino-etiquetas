@@ -2,8 +2,12 @@ const A4 = { largura: 595.28, altura: 841.89 };
 const MARGEM = 14;
 const FOLGA = 12;
 const LIMIAR_BRANCO = 245;
+const MM = 72 / 25.4;
+const TERMICA = { largura: 100 * MM, altura: 150 * MM };
+const MARGEM_TERMICA = 2 * MM;
+const ESCALA_ATENCAO = 0.85;
 
-const { PDFDocument, rgb } = PDFLib;
+const { PDFDocument, rgb, degrees } = PDFLib;
 
 pdfjsLib.GlobalWorkerOptions.workerSrc = URL.createObjectURL(
   new Blob([document.getElementById('pdf-worker').textContent], { type: 'text/javascript' })
@@ -29,7 +33,7 @@ async function caixaDoConteudo(pagina, viewport) {
       }
     }
   }
-  if (x1 < 0) return { x0: 0, y0: 0, x1: viewport.width, y1: viewport.height };
+  if (x1 < 0) return { x0: 0, y0: 0, x1: viewport.width, y1: viewport.height, vazia: true };
   return { x0, y0, x1: x1 + 1, y1: y1 + 1 };
 }
 
@@ -50,6 +54,8 @@ async function lerPaginas(bytes) {
       largura: viewport.width,
       altura: viewport.height,
       caixa: await caixaDoConteudo(pagina, viewport),
+      viewport,
+      giro: pagina.rotate,
     });
   }
   return paginas;
@@ -319,8 +325,65 @@ async function montar(bytes, paginas, pares, porFolha) {
   return { bytes: await saida.save(), folhas: saida.getPageCount(), avisos };
 }
 
+function limitesNoPdf(pagina) {
+  const { x0, y0, x1, y1 } = limitesDe(pagina);
+  const [ax, ay] = pagina.viewport.convertToPdfPoint(x0, y0);
+  const [bx, by] = pagina.viewport.convertToPdfPoint(x1, y1);
+  return { left: Math.min(ax, bx), right: Math.max(ax, bx), bottom: Math.min(ay, by), top: Math.max(ay, by) };
+}
+
+async function desenharTermica(saida, origem, pagina) {
+  const limites = limitesNoPdf(pagina);
+  const [peca] = await saida.embedPages([origem.getPage(pagina.indice)], [limites]);
+  const larguraPeca = limites.right - limites.left;
+  const alturaPeca = limites.top - limites.bottom;
+  const deLado = pagina.giro % 180 !== 0;
+  const largura = deLado ? alturaPeca : larguraPeca;
+  const altura = deLado ? larguraPeca : alturaPeca;
+
+  const larguraUtil = TERMICA.largura - 2 * MARGEM_TERMICA;
+  const alturaUtil = TERMICA.altura - 2 * MARGEM_TERMICA;
+  const escalaEmPe = Math.min(larguraUtil / largura, alturaUtil / altura);
+  const escalaDeitada = Math.min(larguraUtil / altura, alturaUtil / largura);
+  const deitar = escalaDeitada > escalaEmPe * 1.05;
+  const escala = deitar ? escalaDeitada : escalaEmPe;
+
+  const angulo = (((deitar ? 90 : 0) - pagina.giro) % 360 + 360) % 360;
+  const w = larguraPeca * escala;
+  const h = alturaPeca * escala;
+  const [caixaL, caixaA] = angulo % 180 === 0 ? [w, h] : [h, w];
+  const esquerda = (TERMICA.largura - caixaL) / 2;
+  const base = (TERMICA.altura - caixaA) / 2;
+  const [dx, dy] = { 0: [0, 0], 90: [h, 0], 180: [w, h], 270: [0, w] }[angulo];
+
+  saida.addPage([TERMICA.largura, TERMICA.altura]).drawPage(peca, {
+    x: esquerda + dx,
+    y: base + dy,
+    width: w,
+    height: h,
+    rotate: degrees(angulo),
+  });
+  return { escala, deitar };
+}
+
+async function montarTermica(bytes, paginas) {
+  const origem = await PDFDocument.load(bytes);
+  const saida = await PDFDocument.create();
+  const etiquetas = [];
+  for (const pagina of paginas) {
+    if (pagina.caixa.vazia) continue;
+    const { escala, deitar } = await desenharTermica(saida, origem, pagina);
+    etiquetas.push({ pagina: pagina.indice + 1, tipo: tipoDaPagina(pagina), escala, deitar });
+  }
+  if (!etiquetas.length) throw new Error('o arquivo só tem páginas em branco.');
+  return { bytes: await saida.save(), folhas: saida.getPageCount(), etiquetas };
+}
+
 async function processar(bytes, porFolha = 1) {
   const paginas = await lerPaginas(bytes);
+  if (porFolha === 'termica') {
+    return { paginas: paginas.length, ...(await montarTermica(bytes, paginas)) };
+  }
   const pares = parear(paginas);
   const resultado = await montar(bytes, paginas, pares, porFolha);
   return { paginas: paginas.length, pares, ...resultado };
@@ -353,22 +416,65 @@ function textoDoDestinatario(par) {
   return par.destinatario;
 }
 
+function botoesDoPdf(bytes, nomeSaida) {
+  const url = URL.createObjectURL(new Blob([bytes], { type: 'application/pdf' }));
+  return criarElemento('div', { class: 'acoes' }, [
+    criarElemento('a', { class: 'botao', href: url, download: nomeSaida, texto: 'Baixar PDF' }),
+    criarElemento('a', { class: 'botao secundario', href: url, target: '_blank', rel: 'noopener', texto: 'Abrir para imprimir' }),
+  ]);
+}
+
+function tabela(titulo, colunas, linhas) {
+  return criarElemento('details', {}, [
+    criarElemento('summary', { texto: titulo }),
+    criarElemento('table', {}, [
+      criarElemento('thead', {}, [criarElemento('tr', {}, colunas.map((t) => criarElemento('th', { texto: t })))]),
+      criarElemento('tbody', {}, linhas.map((celulas) =>
+        criarElemento('tr', {}, celulas.map((t) => criarElemento('td', { texto: t })))
+      )),
+    ]),
+  ]);
+}
+
+const ROTULO_PAGINA = { danfe: 'DANFE', etiqueta: 'Etiqueta', packing: 'Packing list', vazia: 'Etiqueta (imagem)' };
+
+function cartaoTermico(nome, resultado) {
+  const { etiquetas, paginas, folhas } = resultado;
+  const avisos = etiquetas
+    .filter((e) => e.escala < ESCALA_ATENCAO)
+    .map((e) => `Página ${e.pagina}: reduzida para ${Math.round(e.escala * 100)}% para caber. Teste a leitura do código de barras.`);
+  const ignoradas = paginas - folhas;
+  if (ignoradas) avisos.push(`${ignoradas} ${plural(ignoradas, 'página em branco foi ignorada', 'páginas em branco foram ignoradas')}.`);
+
+  return criarElemento('section', { class: 'cartao' }, [
+    criarElemento('h2', { texto: nome }),
+    criarElemento('p', {
+      class: 'resumo',
+      texto: `${folhas} ${plural(folhas, 'etiqueta', 'etiquetas')} 10×15 cm. Imprima com papel 100×150 mm em tamanho real (100%).`,
+    }),
+    botoesDoPdf(resultado.bytes, `10x15-${nome}`),
+    ...avisos.map((aviso) => criarElemento('p', { class: 'aviso', texto: aviso })),
+    tabela('Ver etiquetas', ['Página', 'Tipo', 'Tamanho'], etiquetas.map((e) => [
+      String(e.pagina),
+      ROTULO_PAGINA[e.tipo],
+      `${Math.round(e.escala * 100)}%${e.deitar ? ' (girada)' : ''}`,
+    ])),
+  ]);
+}
+
 function cartaoDeResultado(nome, resultado, porFolha) {
-  const url = URL.createObjectURL(new Blob([resultado.bytes], { type: 'application/pdf' }));
-  const nomeSaida = `A4-${porFolha}por-folha-${nome}`;
+  if (porFolha === 'termica') return cartaoTermico(nome, resultado);
 
   const semPar = resultado.pares.filter((p) => p.modelo === 'solta').length;
   const porOrdem = resultado.pares.filter((p) => p.metodo === 'ordem das páginas').length;
 
-  const linhas = resultado.pares.map((par, i) =>
-    criarElemento('tr', {}, [
-      criarElemento('td', { texto: String(i + 1) }),
-      criarElemento('td', { texto: par.rotulo }),
-      criarElemento('td', { texto: ROTULO_MODELO[par.modelo] }),
-      criarElemento('td', { texto: par.metodo ? `por ${par.metodo}` : '—' }),
-      criarElemento('td', { texto: textoDoDestinatario(par) }),
-    ])
-  );
+  const linhas = resultado.pares.map((par, i) => [
+    String(i + 1),
+    par.rotulo,
+    ROTULO_MODELO[par.modelo],
+    par.metodo ? `por ${par.metodo}` : '—',
+    textoDoDestinatario(par),
+  ]);
 
   const divergentes = resultado.pares.filter((p) => p.conferencia === 'diverge');
   const avisos = [...resultado.avisos];
@@ -384,20 +490,9 @@ function cartaoDeResultado(nome, resultado, porFolha) {
       class: 'resumo',
       texto: `${resultado.paginas} ${plural(resultado.paginas, 'página', 'páginas')} ${resultado.paginas === 1 ? 'virou' : 'viraram'} ${resultado.folhas} ${plural(resultado.folhas, 'folha', 'folhas')} A4 (${resultado.pares.length} ${plural(resultado.pares.length, 'pedido', 'pedidos')}).`,
     }),
-    criarElemento('div', { class: 'acoes' }, [
-      criarElemento('a', { class: 'botao', href: url, download: nomeSaida, texto: 'Baixar PDF' }),
-      criarElemento('a', { class: 'botao secundario', href: url, target: '_blank', rel: 'noopener', texto: 'Abrir para imprimir' }),
-    ]),
+    botoesDoPdf(resultado.bytes, `A4-${porFolha}por-folha-${nome}`),
     ...avisos.map((aviso) => criarElemento('p', { class: 'aviso', texto: aviso })),
-    criarElemento('details', {}, [
-      criarElemento('summary', { texto: 'Ver pedidos' }),
-      criarElemento('table', {}, [
-        criarElemento('thead', {}, [
-          criarElemento('tr', {}, ['#', 'Pedido', 'Tipo', 'Pareamento', 'Destinatário'].map((t) => criarElemento('th', { texto: t }))),
-        ]),
-        criarElemento('tbody', {}, linhas),
-      ]),
-    ]),
+    tabela('Ver pedidos', ['#', 'Pedido', 'Tipo', 'Pareamento', 'Destinatário'], linhas),
   ]);
 }
 
@@ -412,7 +507,8 @@ const CHAVE_PREFERENCIA = 'etiquetas-por-folha';
 let arquivosAtuais = [];
 
 function pedidosPorFolha() {
-  return Number(document.querySelector('input[name="porFolha"]:checked').value);
+  const { value } = document.querySelector('input[name="porFolha"]:checked');
+  return value === 'termica' ? value : Number(value);
 }
 
 function lembrarPreferencia() {
